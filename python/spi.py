@@ -116,54 +116,59 @@ class PandaSpiHandle(BaseHandle):
 
     raise PandaSpiMissingAck
 
-  def _transfer(self, spi, endpoint: int, data, timeout: int, max_rx_len: int = 1000, expect_disconnect: bool = False) -> bytes:
+  def _transfer_raw(self, endpoint: int, data, timeout: int, max_rx_len: int = 1000, expect_disconnect: bool = False) -> bytes:
+    with self.dev.acquire() as spi:
+      logging.debug("- send header")
+      packet = struct.pack("<BBHH", SYNC, endpoint, len(data), max_rx_len)
+      packet += bytes([reduce(lambda x, y: x^y, packet) ^ CHECKSUM_START])
+      spi.xfer2(packet)
+
+      logging.debug("- waiting for header ACK")
+      self._wait_for_ack(spi, HACK, timeout, 0x11)
+
+      # send data
+      logging.debug("- sending data")
+      packet = bytes([*data, self._calc_checksum(data)])
+      spi.xfer2(packet)
+
+      if expect_disconnect:
+        logging.debug("- expecting disconnect, returning")
+        return b""
+      else:
+        logging.debug("- waiting for data ACK")
+        self._wait_for_ack(spi, DACK, timeout, 0x13)
+
+        # get response length, then response
+        response_len_bytes = bytes(spi.xfer2(b"\x00" * 2))
+        response_len = struct.unpack("<H", response_len_bytes)[0]
+        if response_len > max_rx_len:
+          raise PandaSpiException("response length greater than max")
+
+        logging.debug("- receiving response")
+        dat = bytes(spi.xfer2(b"\x00" * (response_len + 1)))
+        if self._calc_checksum([DACK, *response_len_bytes, *dat]) != 0:
+          raise PandaSpiBadChecksum
+
+        return dat[:-1]
+
+  def _transfer(self, endpoint: int, data, timeout: int, max_rx_len: int = 1000, expect_disconnect: bool = False) -> bytes:
     logging.debug("starting transfer: endpoint=%d, max_rx_len=%d", endpoint, max_rx_len)
     logging.debug("==============================================")
 
     n = 0
+    timeout_count = 0
     start_time = time.monotonic()
     exc = PandaSpiException()
-    while (time.monotonic() - start_time) < timeout*1e-3:
+    while (timeout_count < 3) or ((time.monotonic() - start_time) < timeout*1e-3):
       n += 1
       logging.debug("\ntry #%d", n)
       try:
-        logging.debug("- send header")
-        packet = struct.pack("<BBHH", SYNC, endpoint, len(data), max_rx_len)
-        packet += bytes([reduce(lambda x, y: x^y, packet) ^ CHECKSUM_START])
-        spi.xfer2(packet)
-
-        to = timeout - (time.monotonic() - start_time)*1e3
-        logging.debug("- waiting for header ACK")
-        self._wait_for_ack(spi, HACK, int(to), 0x11)
-
-        # send data
-        logging.debug("- sending data")
-        packet = bytes([*data, self._calc_checksum(data)])
-        spi.xfer2(packet)
-
-        if expect_disconnect:
-          logging.debug("- expecting disconnect, returning")
-          return b""
-        else:
-          to = timeout - (time.monotonic() - start_time)*1e3
-          logging.debug("- waiting for data ACK")
-          self._wait_for_ack(spi, DACK, int(to), 0x13)
-
-          # get response length, then response
-          response_len_bytes = bytes(spi.xfer2(b"\x00" * 2))
-          response_len = struct.unpack("<H", response_len_bytes)[0]
-          if response_len > max_rx_len:
-            raise PandaSpiException("response length greater than max")
-
-          logging.debug("- receiving response")
-          dat = bytes(spi.xfer2(b"\x00" * (response_len + 1)))
-          if self._calc_checksum([DACK, *response_len_bytes, *dat]) != 0:
-            raise PandaSpiBadChecksum
-
-          return dat[:-1]
+        return self._transfer_raw(endpoint, data, timeout, max_rx_len, expect_disconnect)
       except PandaSpiException as e:
         exc = e
         logging.debug("SPI transfer failed, retrying", exc_info=True)
+        if isinstance(e, PandaSpiMissingAck):
+          timeout_count += 1
 
     raise exc
 
@@ -172,28 +177,24 @@ class PandaSpiHandle(BaseHandle):
     self.dev.close()
 
   def controlWrite(self, request_type: int, request: int, value: int, index: int, data, timeout: int = TIMEOUT, expect_disconnect: bool = False):
-    with self.dev.acquire() as spi:
-      return self._transfer(spi, 0, struct.pack("<BHHH", request, value, index, 0), timeout, expect_disconnect=expect_disconnect)
+    return self._transfer(0, struct.pack("<BHHH", request, value, index, 0), timeout, expect_disconnect=expect_disconnect)
 
   def controlRead(self, request_type: int, request: int, value: int, index: int, length: int, timeout: int = TIMEOUT):
-    with self.dev.acquire() as spi:
-      return self._transfer(spi, 0, struct.pack("<BHHH", request, value, index, length), timeout)
+    return self._transfer(0, struct.pack("<BHHH", request, value, index, length), timeout)
 
   # TODO: implement these properly
   def bulkWrite(self, endpoint: int, data: List[int], timeout: int = TIMEOUT) -> int:
-    with self.dev.acquire() as spi:
-      for x in range(math.ceil(len(data) / XFER_SIZE)):
-        self._transfer(spi, endpoint, data[XFER_SIZE*x:XFER_SIZE*(x+1)], timeout)
-      return len(data)
+    for x in range(math.ceil(len(data) / XFER_SIZE)):
+      self._transfer(endpoint, data[XFER_SIZE*x:XFER_SIZE*(x+1)], timeout)
+    return len(data)
 
   def bulkRead(self, endpoint: int, length: int, timeout: int = TIMEOUT) -> bytes:
     ret: List[int] = []
-    with self.dev.acquire() as spi:
-      for _ in range(math.ceil(length / XFER_SIZE)):
-        d = self._transfer(spi, endpoint, [], timeout, max_rx_len=XFER_SIZE)
-        ret += d
-        if len(d) < XFER_SIZE:
-          break
+    for _ in range(math.ceil(length / XFER_SIZE)):
+      d = self._transfer(endpoint, [], timeout, max_rx_len=XFER_SIZE)
+      ret += d
+      if len(d) < XFER_SIZE:
+        break
     return bytes(ret)
 
 
